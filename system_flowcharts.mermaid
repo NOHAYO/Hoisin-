@@ -1,0 +1,367 @@
+# System Flowcharts (Mermaid Format)
+
+## 1. System Initialization Flowchart
+
+```mermaid
+flowchart TD
+    Start([System Power On/Reset]) --> HAL[Initialize STM32 HAL<br/>- System Clock<br/>- GPIO<br/>- I2C 400kHz<br/>- UART 115200<br/>- Timers]
+    
+    HAL --> PMIC[Initialize MAX20303 PMIC]
+    
+    PMIC --> PMIC1{I2C Comm<br/>OK?}
+    PMIC1 -->|No| Error1[Error: PMIC Not Found]
+    PMIC1 -->|Yes| PMIC2[Read Device ID]
+    PMIC2 --> PMIC3[Configure LDO1 1.8V]
+    PMIC3 --> PMIC4[Configure LDO2 1.8V]
+    PMIC4 --> PMIC5[Configure Buck-Boost]
+    PMIC5 --> PMIC6[Enable Power Outputs]
+    PMIC6 --> Wait1[Wait 50ms for<br/>Power Stabilization]
+    
+    Wait1 --> PPG[Initialize MAX86171]
+    
+    PPG --> PPG1{I2C Comm<br/>OK?}
+    PPG1 -->|No| Error2[Error: PPG Not Found]
+    PPG1 -->|Yes| PPG2[Software Reset]
+    PPG2 --> PPG3[Read Part ID]
+    PPG3 --> PPG4{Valid<br/>Part ID?}
+    PPG4 -->|No| Error2
+    PPG4 -->|Yes| PPG5[Configure FIFO<br/>Threshold: 10 samples]
+    PPG5 --> PPG6[Set Sample Rate 100Hz]
+    PPG6 --> PPG7[Configure PPG Mode]
+    PPG7 --> PPG8[Set LED Current 50mA]
+    PPG8 --> PPG9[Enable FIFO Interrupt]
+    PPG9 --> PPG10[Clear FIFO]
+    PPG10 --> PPG11[Start Sampling]
+    
+    PPG11 --> Accel[Initialize KX122]
+    
+    Accel --> Accel1{I2C Comm<br/>OK?}
+    Accel1 -->|No| Error3[Error: Accel Not Found]
+    Accel1 -->|Yes| Accel2[Software Reset]
+    Accel2 --> Accel3[Read WHO_AM_I]
+    Accel3 --> Accel4{Valid<br/>ID 0x1A?}
+    Accel4 -->|No| Error3
+    Accel4 -->|Yes| Accel5[Set Stand-by Mode]
+    Accel5 --> Accel6[Configure ODR 100Hz]
+    Accel6 --> Accel7[Set Range ±2g]
+    Accel7 --> Accel8[Enable High Resolution]
+    Accel8 --> Accel9[Configure Buffer/FIFO]
+    Accel9 --> Accel10[Enable Data Ready INT]
+    Accel10 --> Accel11[Set Operating Mode]
+    
+    Accel11 --> Sync[Synchronization]
+    Sync --> Sync1[Wait for First Samples]
+    Sync1 --> Sync2[Verify Sample Timing]
+    Sync2 --> MainLoop([Enter Main Loop])
+    
+    Error1 --> ErrorHandler[Error Handler<br/>- Log error<br/>- Retry or halt]
+    Error2 --> ErrorHandler
+    Error3 --> ErrorHandler
+    ErrorHandler --> End([System Halt])
+    
+    style Start fill:#90EE90
+    style MainLoop fill:#90EE90
+    style Error1 fill:#FFB6C1
+    style Error2 fill:#FFB6C1
+    style Error3 fill:#FFB6C1
+    style End fill:#FFB6C1
+```
+
+## 2. Main Data Acquisition Loop
+
+```mermaid
+flowchart TD
+    Start([Main Loop Start]) --> Timer[Wait for Timer Event<br/>10ms period]
+    
+    Timer --> CheckPPG[Check MAX86171<br/>FIFO Status]
+    
+    CheckPPG --> PPGReady{FIFO Level<br/>≥ 10?}
+    
+    PPGReady -->|No| CheckAccel[Check KX122 Status]
+    PPGReady -->|Yes| ReadPPG[Read MAX86171 FIFO<br/>- Burst read samples<br/>- Parse 19-bit data<br/>- Store in buffer]
+    
+    ReadPPG --> CheckAccel
+    
+    CheckAccel --> AccelReady{Data Ready<br/>Interrupt?}
+    
+    AccelReady -->|No| Timer
+    AccelReady -->|Yes| ReadAccel[Read KX122 Data<br/>- Read XOUT_L/H<br/>- Read YOUT_L/H<br/>- Read ZOUT_L/H<br/>- Convert to g values]
+    
+    ReadAccel --> Sync[Synchronize Data<br/>- Add timestamps<br/>- Align PPG and Accel<br/>- Create synced sample]
+    
+    Sync --> Package[Package Data<br/>- Create packet header<br/>- Add sequence number<br/>- Add data payload<br/>- Calculate CRC16]
+    
+    Package --> UART[Transmit via UART<br/>- Send to NRF52<br/>- Wait for TX complete]
+    
+    UART --> CheckStatus[Check System Status]
+    
+    CheckStatus --> Battery{Battery<br/>Level OK?}
+    
+    Battery -->|Low| BatteryWarn[Send Battery Warning]
+    Battery -->|OK| CheckErrors
+    
+    BatteryWarn --> CheckErrors{Any Sensor<br/>Errors?}
+    
+    CheckErrors -->|Yes| HandleError[Handle Error<br/>- Log error<br/>- Attempt recovery<br/>- Send error packet]
+    CheckErrors -->|No| PowerMgmt[Power Management<br/>- Update power state<br/>- Adjust sensor config]
+    
+    HandleError --> PowerMgmt
+    
+    PowerMgmt --> Timer
+    
+    style Start fill:#90EE90
+    style Timer fill:#87CEEB
+    style UART fill:#FFD700
+    style HandleError fill:#FFB6C1
+```
+
+## 3. MAX86171 Driver State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Uninitialized
+    
+    Uninitialized --> Initializing : Init()
+    
+    Initializing --> CheckComm : Verify I2C
+    CheckComm --> Error : I2C Fail
+    CheckComm --> Reset : I2C OK
+    
+    Reset --> ReadID : Software Reset
+    ReadID --> Error : Invalid ID
+    ReadID --> Configure : Valid ID
+    
+    Configure --> ConfigFIFO : Set Mode
+    ConfigFIFO --> ConfigRate : FIFO Setup
+    ConfigRate --> ConfigLED : Rate 100Hz
+    ConfigLED --> Ready : LED Current
+    
+    Ready --> Sampling : StartSampling()
+    Sampling --> Reading : FIFO Ready INT
+    Reading --> Sampling : Read FIFO
+    
+    Sampling --> Ready : StopSampling()
+    
+    Ready --> Shutdown : Shutdown()
+    Sampling --> Shutdown : Shutdown()
+    
+    Error --> Uninitialized : Reset()
+    Shutdown --> Uninitialized : Reset()
+    
+    Reading --> Error : I2C Error
+```
+
+## 4. KX122 Driver State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Uninitialized
+    
+    Uninitialized --> Initializing : Init()
+    
+    Initializing --> CheckComm : Verify I2C
+    CheckComm --> Error : I2C Fail
+    CheckComm --> Reset : I2C OK
+    
+    Reset --> ReadWhoAmI : Software Reset
+    ReadWhoAmI --> Error : Invalid WHO_AM_I
+    ReadWhoAmI --> StandBy : WHO_AM_I = 0x1A
+    
+    StandBy --> Configure : Set Stand-by Mode
+    Configure --> SetODR : Configure Range
+    SetODR --> SetRes : ODR = 100Hz
+    SetRes --> EnableBuffer : High Resolution
+    EnableBuffer --> Ready : Buffer Config
+    
+    Ready --> Operating : Set PC1=1
+    Operating --> DataReady : Wait for DRDY
+    DataReady --> Reading : DRDY INT
+    Reading --> DataReady : Read XYZ
+    
+    Operating --> StandBy : Set PC1=0
+    
+    StandBy --> LowPower : Enable Low Power
+    LowPower --> StandBy : Disable Low Power
+    
+    Ready --> Uninitialized : Reset()
+    Operating --> Uninitialized : Reset()
+    
+    Reading --> Error : I2C Error
+    Error --> Uninitialized : Reset()
+```
+
+## 5. UART Protocol State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    
+    Idle --> BuildPacket : New Data Available
+    
+    BuildPacket --> AddHeader : Create Packet
+    AddHeader --> AddType : Header = 0xAA55
+    AddType --> AddSeq : Type Field
+    AddSeq --> AddData : Sequence Number
+    AddData --> CalcCRC : Copy Data
+    CalcCRC --> ReadyToSend : Calculate CRC16
+    
+    ReadyToSend --> Transmitting : Start UART TX
+    
+    Transmitting --> WaitTxComplete : DMA Transfer
+    WaitTxComplete --> TxComplete : TX Done INT
+    
+    TxComplete --> Idle : Success
+    
+    Transmitting --> TxError : Timeout/Error
+    TxError --> Retry : Error Count < 3
+    Retry --> Transmitting : Retry
+    TxError --> Failed : Error Count ≥ 3
+    
+    Failed --> Idle : Discard Packet
+```
+
+## 6. NRF52 UART Receive State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> WaitHeader
+    
+    WaitHeader --> Header1 : Receive Byte
+    Header1 --> Header2 : Byte = 0xAA
+    Header1 --> WaitHeader : Byte ≠ 0xAA
+    
+    Header2 --> ReceiveType : Byte = 0x55
+    Header2 --> WaitHeader : Byte ≠ 0x55
+    
+    ReceiveType --> ReceiveLength : Store Type
+    ReceiveLength --> ReceiveSeq : Store Length
+    ReceiveSeq --> ReceiveData : Store Sequence
+    
+    ReceiveData --> CheckComplete : Receive Data Bytes
+    CheckComplete --> ReceiveData : More Data
+    CheckComplete --> ReceiveCRC : All Data Received
+    
+    ReceiveCRC --> ValidateCRC : Receive 2 CRC Bytes
+    
+    ValidateCRC --> ProcessPacket : CRC OK
+    ValidateCRC --> WaitHeader : CRC Fail
+    
+    ProcessPacket --> ParseData : Route by Type
+    ParseData --> UpdateBLE : Extract Sensor Data
+    UpdateBLE --> SendNotification : Update Characteristics
+    
+    SendNotification --> WaitHeader : Notification Sent
+    
+    state ProcessPacket {
+        [*] --> CheckType
+        CheckType --> DataPacket : Type = 0x01
+        CheckType --> StatusPacket : Type = 0x02
+        CheckType --> ErrorPacket : Type = 0x03
+        
+        DataPacket --> [*]
+        StatusPacket --> [*]
+        ErrorPacket --> [*]
+    }
+```
+
+## 7. Power State Management
+
+```mermaid
+stateDiagram-v2
+    [*] --> PowerOn
+    
+    PowerOn --> Active : System Init Complete
+    
+    Active --> Idle : No Activity for 30s
+    Active --> DeepSleep : User Command
+    
+    Idle --> Active : User Activity
+    Idle --> DeepSleep : Battery Critical
+    Idle --> DeepSleep : User Command
+    
+    DeepSleep --> PowerOn : Wake-up Event
+    
+    state Active {
+        [*] --> FullPower
+        FullPower --> Sampling : Start Acquisition
+        Sampling --> Processing : Read Sensors
+        Processing --> Transmitting : Package Data
+        Transmitting --> Sampling : TX Complete
+        Sampling --> FullPower : Stop Acquisition
+    }
+    
+    state Idle {
+        [*] --> ReducedPower
+        ReducedPower --> SensorsStandby : Disable Sampling
+        SensorsStandby --> UARTStandby : Sensors Idle
+        UARTStandby --> BLEAdvertising : UART Idle
+    }
+    
+    state DeepSleep {
+        [*] --> PowerDown
+        PowerDown --> SensorsOff : PMIC Disable LDOs
+        SensorsOff --> STM32Stop : Sensors Off
+        STM32Stop --> NRFSystemOff : STM32 in STOP Mode
+    }
+```
+
+## 8. Error Recovery Flowchart
+
+```mermaid
+flowchart TD
+    Error([Error Detected]) --> Type{Error Type?}
+    
+    Type -->|I2C Timeout| I2C[I2C Error Handler]
+    Type -->|Sensor Error| Sensor[Sensor Error Handler]
+    Type -->|UART Error| UART[UART Error Handler]
+    Type -->|FIFO Overflow| FIFO[FIFO Overflow Handler]
+    
+    I2C --> I2CRetry{Retry Count<br/>< 3?}
+    I2CRetry -->|Yes| I2CInc[Increment Retry]
+    I2CInc --> I2CReset[Software I2C Reset]
+    I2CReset --> I2CWait[Wait 10ms]
+    I2CWait --> Continue1([Return to Main Loop])
+    
+    I2CRetry -->|No| I2CHard[Hardware I2C Reset<br/>Reinit Peripheral]
+    I2CHard --> I2CRecover{Recovery<br/>Success?}
+    I2CRecover -->|Yes| Continue1
+    I2CRecover -->|No| Critical[Critical Error<br/>System Reset Required]
+    
+    Sensor --> SensorCheck{Sensor<br/>Responding?}
+    SensorCheck -->|Yes| SensorSoft[Soft Reset Sensor]
+    SensorSoft --> SensorReconfig[Reconfigure Sensor]
+    SensorReconfig --> Continue2([Return to Main Loop])
+    
+    SensorCheck -->|No| SensorHard[Full Sensor Reinit]
+    SensorHard --> SensorTest{Init<br/>Success?}
+    SensorTest -->|Yes| Continue2
+    SensorTest -->|No| SensorDisable[Disable Sensor<br/>Log Error]
+    SensorDisable --> Continue2
+    
+    UART --> UARTClear[Clear UART Errors]
+    UARTClear --> UARTReinit[Reinit UART Peripheral]
+    UARTReinit --> Continue3([Return to Main Loop])
+    
+    FIFO --> FIFOClear[Clear FIFO]
+    FIFOClear --> FIFORestart[Restart Sampling]
+    FIFORestart --> Continue4([Return to Main Loop])
+    
+    Critical --> Reset[Watchdog Reset<br/>or Manual Reset]
+    Reset --> End([System Restart])
+    
+    style Error fill:#FFB6C1
+    style Critical fill:#FF6B6B
+    style Reset fill:#FF6B6B
+    style Continue1 fill:#90EE90
+    style Continue2 fill:#90EE90
+    style Continue3 fill:#90EE90
+    style Continue4 fill:#90EE90
+```
+
+---
+
+**Note**: These Mermaid diagrams can be rendered in:
+- GitHub (native support)
+- VS Code (with Mermaid extension)
+- Online Mermaid editors (mermaid.live)
+- Documentation tools (GitBook, MkDocs, etc.)
